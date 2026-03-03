@@ -1,0 +1,15 @@
+too-many-lines-threshold = 250
+
+# CODESTYLE.md: mod -> use -> const/static -> type -> impl -> fn
+module-item-order-groupings = [
+  ["mods", ["extern_crate", "mod", "foreign_mod"]],
+  ["uses", ["use"]],
+  ["macros", ["macro"]],
+  ["asm", ["global_asm"]],
+  ["consts", ["static", "const"]],
+  ["types", ["ty_alias", "enum", "struct", "union", "trait", "trait_alias"]],
+  ["impls", ["impl"]],
+  ["fns", ["fn"]],
+]
+module-items-ordered-within-groupings = "none"
+source-item-ordering = ["module"]

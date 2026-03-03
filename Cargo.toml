@@ -1,0 +1,28 @@
+[package]
+name = "chatgptiosappsslpinningraper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.5.60", features = ["derive"] }
+goblin = "0.10.5"
+hex = "0.4.3"
+memchr = "2.8.0"
+scroll = "0.13.0"
+tempfile = "3.26.0"
+walkdir = "2.5.0"
+zip = "8.1.0"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+arbitrary_source_item_ordering = "deny"
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

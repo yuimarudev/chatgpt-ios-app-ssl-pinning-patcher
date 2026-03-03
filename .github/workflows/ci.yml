@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BIN_NAME: chatgptiosappsslpinningraper
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            exe_suffix: ""
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            exe_suffix: ""
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            exe_suffix: ""
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            exe_suffix: ""
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            exe_suffix: ".exe"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          profile: minimal
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux deps (musl + mold when available)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          sudo apt-get install -y mold || true
+
+      - name: Configure Linux musl linker
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)
+              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "${GITHUB_ENV}"
+              echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "${GITHUB_ENV}"
+              ;;
+            aarch64-unknown-linux-musl)
+              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "${GITHUB_ENV}"
+              echo "CC_aarch64_unknown_linux_musl=musl-gcc" >> "${GITHUB_ENV}"
+              ;;
+          esac
+
+      - name: Set RUSTFLAGS (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          THREADS="$(getconf _NPROCESSORS_ONLN || nproc || sysctl -n hw.ncpu || echo 4)"
+          FLAGS="-Z threads=${THREADS}"
+          if [ "${{ runner.os }}" = "Linux" ] && command -v mold >/dev/null 2>&1; then
+            FLAGS="${FLAGS} -C link-arg=-fuse-ld=mold"
+          fi
+          echo "RUSTFLAGS=${FLAGS}" >> "${GITHUB_ENV}"
+
+      - name: Set RUSTFLAGS (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $threads = [Environment]::ProcessorCount
+          $flags = "-Z threads=$threads"
+          if (Get-Command mold -ErrorAction SilentlyContinue) {
+            $flags += " -C link-arg=-fuse-ld=mold"
+          }
+          "RUSTFLAGS=$flags" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build
+        run: cargo +nightly build --release --target ${{ matrix.target }}
+
+      - name: Upload release binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ env.BIN_NAME }}${{ matrix.exe_suffix }}
+          if-no-files-found: error
