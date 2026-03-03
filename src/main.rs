@@ -1,6 +1,10 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser as ClapParser;
 use goblin::mach::load_command::CommandVariant;
+use goblin::mach::{
+  Mach,
+  constants::cputype::{CPU_TYPE_ARM64, CPU_TYPE_ARM64_32, CPU_TYPE_X86_64},
+};
 use memchr::memmem;
 use scroll::{LE, Pread};
 use std::fs::{self, File};
@@ -67,7 +71,14 @@ impl MachO {
         vmsize: seg.vmsize,
       })
       .collect();
-    let image_base = segments.first().map_or(0, |s| s.vmaddr);
+    let image_base = parsed
+      .segments
+      .iter()
+      .find(|seg| seg.name().is_ok_and(|name| name == "__TEXT"))
+      .map_or_else(
+        || segments.iter().map(|seg| seg.vmaddr).min().unwrap_or(0),
+        |seg| seg.vmaddr,
+      );
     let mut text = None;
     let mut classlist = None;
 
@@ -99,27 +110,32 @@ impl MachO {
     for lc in &parsed.load_commands {
       if let CommandVariant::DyldChainedFixups(ref cmd) = lc.command {
         let dataoff = usize::try_from(cmd.dataoff)?;
-        let starts_offset: u32 = data.pread_with(dataoff + 4, LE).unwrap();
+        let starts_offset: u32 = data
+          .pread_with(dataoff + 4, LE)
+          .context("dyld chained fixups: failed to read starts_offset")?;
         let starts = dataoff + usize::try_from(starts_offset)?;
-        let seg_count: u32 = data.pread_with(starts, LE).unwrap();
+        let seg_count: u32 = data
+          .pread_with(starts, LE)
+          .context("dyld chained fixups: failed to read seg_count")?;
 
         for i in 0..usize::try_from(seg_count)? {
-          let seg_info_off: u32 = data.pread_with(starts + 4 + i * 4, LE).unwrap();
+          let seg_info_off: u32 = data
+            .pread_with(starts + 4 + i * 4, LE)
+            .context("dyld chained fixups: failed to read seg_info_offset")?;
 
           if seg_info_off == 0 {
             continue;
           }
 
           let base = starts + usize::try_from(seg_info_off)?;
-          let pf: u16 = data.pread_with(base + 6, LE).unwrap();
+          let pf: u16 = data
+            .pread_with(base + 6, LE)
+            .context("dyld chained fixups: failed to read pointer_format")?;
 
           ptr_fmt = match pf {
             2 => PtrFmt::Chained64,
             6 => PtrFmt::Chained64Offset,
-            _ => {
-              eprintln!("unsupported chained fixup format: {pf}, trying raw format");
-              PtrFmt::Raw
-            }
+            _ => bail!("unsupported dyld chained fixup pointer format: {pf}"),
           };
 
           break;
@@ -192,28 +208,31 @@ impl MachO {
 
   fn text_file_range(&self) -> Option<(usize, usize)> {
     let t = self.text.as_ref()?;
-    let start = usize::try_from(t.offset).unwrap();
+    let start = usize::try_from(t.offset).ok()?;
     let size = usize::try_from(t.size).ok()?;
+    let end = start.checked_add(size)?;
 
-    Some((start, start + size))
+    Some((start, end))
   }
 }
 
-fn read_u32_le(data: &[u8], off: usize) -> u32 {
-  data.pread_with(off, LE).unwrap()
+fn read_u32_le(data: &[u8], off: usize) -> Option<u32> {
+  data.pread_with(off, LE).ok()
 }
 
-fn read_u64_le(data: &[u8], off: usize) -> u64 {
-  data.pread_with(off, LE).unwrap()
+fn read_u64_le(data: &[u8], off: usize) -> Option<u64> {
+  data.pread_with(off, LE).ok()
 }
 
-fn read_i32_le(data: &[u8], off: usize) -> i32 {
-  data.pread_with(off, LE).unwrap()
+fn read_i32_le(data: &[u8], off: usize) -> Option<i32> {
+  data.pread_with(off, LE).ok()
 }
 
-fn read_cstring(data: &[u8], off: usize) -> &str {
-  let end = memchr::memchr(0, &data[off..]).unwrap_or(0);
-  std::str::from_utf8(&data[off..off + end]).unwrap_or("")
+fn read_cstring(data: &[u8], off: usize) -> Option<&str> {
+  let bytes = data.get(off..)?;
+  let end = memchr::memchr(0, bytes).unwrap_or(bytes.len());
+
+  std::str::from_utf8(&bytes[..end]).ok()
 }
 
 fn format_mb(bytes: u64) -> String {
@@ -221,6 +240,43 @@ fn format_mb(bytes: u64) -> String {
   let frac = (bytes % (1024 * 1024)) * 10 / (1024 * 1024);
 
   format!("{whole}.{frac}")
+}
+
+fn choose_macho_slice_range(data: &[u8]) -> Result<(usize, usize)> {
+  match Mach::parse(data).context("failed to detect mach-o container type")? {
+    Mach::Binary(_) => Ok((0, data.len())),
+    Mach::Fat(fat) => {
+      let selected = if let Some(arch) = fat.find_cputype(CPU_TYPE_ARM64)? {
+        arch
+      } else if let Some(arch) = fat.find_cputype(CPU_TYPE_ARM64_32)? {
+        arch
+      } else if let Some(arch) = fat.find_cputype(CPU_TYPE_X86_64)? {
+        arch
+      } else {
+        fat
+          .iter_arches()
+          .next()
+          .transpose()?
+          .context("fat mach-o has no architecture entry")?
+      };
+      let start = usize::try_from(selected.offset)?;
+      let size = usize::try_from(selected.size)?;
+      let end = start
+        .checked_add(size)
+        .context("fat mach-o architecture range overflow")?;
+
+      if end > data.len() {
+        bail!("fat mach-o architecture range is out of bounds");
+      }
+
+      eprintln!(
+        "fat mach-o detected; selected cputype=0x{:X}, slice=0x{:X}..0x{:X}",
+        selected.cputype, start, end
+      );
+
+      Ok((start, end))
+    }
+  }
 }
 
 fn vmaddr_add_rel(base: u64, rel: i32) -> u64 {
@@ -238,8 +294,10 @@ fn find_adrp_add_xrefs(data: &[u8], text: (usize, usize), target: usize) -> Vec<
   let mut results = Vec::new();
 
   for off in (start..end).step_by(4) {
+    let Some(insn) = read_u32_le(data, off) else {
+      continue;
+    };
 
-    let insn = read_u32_le(data, off);
     if (insn & 0x9F00_0000) == 0x9000_0000 {
       let immlo = i64::from((insn >> 29) & 0x3);
       let immhi = i64::from((insn >> 5) & 0x7_FFFF);
@@ -260,10 +318,12 @@ fn find_adrp_add_xrefs(data: &[u8], text: (usize, usize), target: usize) -> Vec<
       if let Some(page) = page
         && page == target_page
       {
-        let next = read_u32_le(data, off + 4);
+        let Some(next) = read_u32_le(data, off + 4) else {
+          continue;
+        };
 
         if (next & 0xFFC0_0000) == 0x9100_0000
-          && usize::try_from((next >> 10) & 0xFFF).unwrap() == page_off
+          && usize::try_from((next >> 10) & 0xFFF).ok().is_some_and(|imm12| imm12 == page_off)
         {
           results.push(off);
         }
@@ -296,10 +356,10 @@ fn find_function_start(data: &[u8], ref_offset: usize, text_start: usize) -> Opt
   let mut off = ref_offset.saturating_sub(4);
 
   while off >= lower {
-    let prev = read_u32_le(data, off - 4);
+    let prev = read_u32_le(data, off - 4)?;
     let is_boundary = prev == 0xD65F_03C0 || (prev & 0xFFE0_001F) == 0xD420_0000;
 
-    if is_boundary && is_prologue(read_u32_le(data, off)) {
+    if is_boundary && read_u32_le(data, off).is_some_and(is_prologue) {
       return Some(off);
     }
 
@@ -321,8 +381,8 @@ fn find_method_imp(
     return None;
   }
 
-  let entsize_and_flags = read_u32_le(data, methods_foff);
-  let count = usize::try_from(read_u32_le(data, methods_foff + 4)).unwrap();
+  let entsize_and_flags = read_u32_le(data, methods_foff)?;
+  let count = usize::try_from(read_u32_le(data, methods_foff + 4)?).ok()?;
   let is_relative = entsize_and_flags & 0x8000_0000 != 0;
   let entry_size: usize = if is_relative { 12 } else { 24 };
 
@@ -334,28 +394,28 @@ fn find_method_imp(
     }
 
     let (sel_name, imp_vmaddr) = if is_relative {
-      let name_rel = read_i32_le(data, entry_foff);
-      let imp_rel = read_i32_le(data, entry_foff + 8);
+      let name_rel = read_i32_le(data, entry_foff)?;
+      let imp_rel = read_i32_le(data, entry_foff + 8)?;
       let entry_vm = macho.off2vm(entry_foff)?;
       let selref_vm = vmaddr_add_rel(entry_vm, name_rel);
       let selref_foff = macho.vm2off(selref_vm)?;
 
       if selref_foff + 8 > data.len() {
         continue;
-
       }
-      let sel_ptr = macho.decode_ptr(read_u64_le(data, selref_foff));
+
+      let sel_ptr = macho.decode_ptr(read_u64_le(data, selref_foff)?);
       let sel_foff = macho.vm2off(sel_ptr)?;
-      let name = read_cstring(data, sel_foff);
+      let name = read_cstring(data, sel_foff)?;
       let imp_vm = vmaddr_add_rel(entry_vm + 8, imp_rel);
 
       (name, imp_vm)
     } else {
-      let sel_raw = read_u64_le(data, entry_foff);
+      let sel_raw = read_u64_le(data, entry_foff)?;
       let sel_vm = macho.decode_ptr(sel_raw);
       let sel_foff = macho.vm2off(sel_vm)?;
-      let name = read_cstring(data, sel_foff);
-      let imp_raw = read_u64_le(data, entry_foff + 16);
+      let name = read_cstring(data, sel_foff)?;
+      let imp_raw = read_u64_le(data, entry_foff + 16)?;
       let imp_vm = macho.decode_ptr(imp_raw);
 
       (name, imp_vm)
@@ -382,7 +442,7 @@ fn find_method_in_class(
 
   }
 
-  let data_raw = read_u64_le(data, class_foff + 32);
+  let data_raw = read_u64_le(data, class_foff + 32)?;
   let ro_vmaddr = macho.decode_ptr(data_raw) & !0x7;
   let ro_foff = macho.vm2off(ro_vmaddr)?;
 
@@ -390,7 +450,7 @@ fn find_method_in_class(
     return None;
   }
 
-  let methods_raw = read_u64_le(data, ro_foff + 32);
+  let methods_raw = read_u64_le(data, ro_foff + 32)?;
   let methods_vm = macho.decode_ptr(methods_raw);
 
   if methods_vm == 0 {
@@ -402,7 +462,7 @@ fn find_method_in_class(
 
 fn find_can_init_with_request(data: &[u8], macho: &MachO) -> Option<usize> {
   let cl = macho.classlist.as_ref()?;
-  let cl_foff = usize::try_from(cl.offset).unwrap();
+  let cl_foff = usize::try_from(cl.offset).ok()?;
   let cl_count = usize::try_from(cl.size).ok()? / 8;
 
   for i in 0..cl_count {
@@ -412,7 +472,9 @@ fn find_can_init_with_request(data: &[u8], macho: &MachO) -> Option<usize> {
       break;
     }
 
-    let class_raw = read_u64_le(data, ptr_foff);
+    let Some(class_raw) = read_u64_le(data, ptr_foff) else {
+      continue;
+    };
     let class_vm = macho.decode_ptr(class_raw);
 
     if class_vm == 0 {
@@ -427,7 +489,9 @@ fn find_can_init_with_request(data: &[u8], macho: &MachO) -> Option<usize> {
       continue;
     }
 
-    let data_raw = read_u64_le(data, class_foff + 32);
+    let Some(data_raw) = read_u64_le(data, class_foff + 32) else {
+      continue;
+    };
     let ro_vm = macho.decode_ptr(data_raw) & !0x7;
     let Some(ro_foff) = macho.vm2off(ro_vm) else {
       continue;
@@ -437,12 +501,16 @@ fn find_can_init_with_request(data: &[u8], macho: &MachO) -> Option<usize> {
       continue;
     }
 
-    let name_raw = read_u64_le(data, ro_foff + 24);
+    let Some(name_raw) = read_u64_le(data, ro_foff + 24) else {
+      continue;
+    };
     let name_vm = macho.decode_ptr(name_raw);
     let Some(name_foff) = macho.vm2off(name_vm) else {
       continue;
     };
-    let name = read_cstring(data, name_foff);
+    let Some(name) = read_cstring(data, name_foff) else {
+      continue;
+    };
 
     if !name.contains("CertificatePinningURLProtocol") {
       continue;
@@ -450,7 +518,9 @@ fn find_can_init_with_request(data: &[u8], macho: &MachO) -> Option<usize> {
 
     eprintln!("detected ObjC class: {name}");
 
-    let isa_raw = read_u64_le(data, class_foff);
+    let Some(isa_raw) = read_u64_le(data, class_foff) else {
+      continue;
+    };
     let metaclass_vm = macho.decode_ptr(isa_raw);
 
     if let Some(imp) = find_method_in_class(data, macho, metaclass_vm, "canInitWithRequest:") {
@@ -469,36 +539,34 @@ fn find_handle_pinning_challenge(data: &[u8], macho: &MachO) -> Option<usize> {
   let text = macho.text_file_range()?;
 
   for needle in PINNING_ERROR_STRINGS {
-    let Some(str_off) = memmem::find(data, needle) else {
-      continue;
-    };
+    for str_off in memmem::find_iter(data, needle) {
+      eprintln!(
+        "String  \"{}...\" -> 0x{:08X}",
+        String::from_utf8_lossy(&needle[..needle.len().min(40)]),
+        str_off
+      );
 
-    eprintln!(
-      "String  \"{}...\" -> 0x{:08X}",
-      String::from_utf8_lossy(&needle[..needle.len().min(40)]),
-      str_off
-    );
+      let xrefs = find_adrp_add_xrefs(data, text, str_off);
 
-    let xrefs = find_adrp_add_xrefs(data, text, str_off);
+      if xrefs.is_empty() {
+        continue;
+      }
 
-    if xrefs.is_empty() {
-      continue;
-    }
+      eprintln!(
+        "Reference: {}",
+        xrefs
+          .iter()
+          .map(|x| format!("0x{x:08X}"))
+          .collect::<Vec<_>>()
+          .join(", ")
+      );
 
-    eprintln!(
-      "Reference: {}",
-      xrefs
-        .iter()
-        .map(|x| format!("0x{x:08X}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-    );
-
-    for xref in &xrefs {
-      if let Some(func_start) = find_function_start(data, *xref, text.0)
-        && is_prologue(read_u32_le(data, func_start))
-      {
-        return Some(func_start);
+      for xref in &xrefs {
+        if let Some(func_start) = find_function_start(data, *xref, text.0)
+          && read_u32_le(data, func_start).is_some_and(is_prologue)
+        {
+          return Some(func_start);
+        }
       }
     }
   }
@@ -512,7 +580,7 @@ fn apply_patch(data: &mut [u8], offset: usize, patch: &[u8]) -> bool {
     return false;
   }
 
-  if !is_prologue(read_u32_le(data, offset)) {
+  if !read_u32_le(data, offset).is_some_and(is_prologue) {
     eprintln!("0x{offset:08X} is not function prologue");
     return false;
   }
@@ -570,8 +638,6 @@ fn create_ipa(work_dir: &Path, output: &Path) -> Result<()> {
 
   let file = File::create(output).context("failed to create output file")?;
   let mut zip = zip::ZipWriter::new(file);
-  let options =
-    zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
   let payload = work_dir.join("Payload");
 
   for entry in WalkDir::new(&payload).min_depth(1) {
@@ -586,8 +652,30 @@ fn create_ipa(work_dir: &Path, output: &Path) -> Result<()> {
       } else {
         format!("{rel_str}/")
       };
+      let mut options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+      #[cfg(unix)]
+      {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = fs::metadata(entry_path)?.permissions().mode();
+        options = options.unix_permissions(mode);
+      }
+
       zip.add_directory(&dir_name, options)?;
     } else {
+      let mut options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+      #[cfg(unix)]
+      {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = fs::metadata(entry_path)?.permissions().mode();
+        options = options.unix_permissions(mode);
+      }
+
       zip.start_file(rel_str.as_ref(), options)?;
 
       let mut f = File::open(entry_path)?;
@@ -706,16 +794,21 @@ fn run() -> Result<()> {
     format_mb(u64::try_from(data.len()).unwrap_or(0))
   );
 
-  let macho = MachO::parse(&data)?;
+  let (macho_start, macho_end) = choose_macho_slice_range(&data)?;
+  let macho = MachO::parse(&data[macho_start..macho_end])?;
   let mut applied = 0u32;
 
   eprintln!("patching CertificatePinningURLProtocol.canInitWithRequest:");
 
-  match find_can_init_with_request(&data, &macho) {
+  match find_can_init_with_request(&data[macho_start..macho_end], &macho) {
     Some(addr) => {
       eprintln!("detected: 0x{addr:08X}");
 
-      if apply_patch(&mut data, addr, PATCH_RETURN_FALSE) {
+      if apply_patch(
+        &mut data[macho_start..macho_end],
+        addr,
+        PATCH_RETURN_FALSE,
+      ) {
         applied += 1;
       }
     }
@@ -725,11 +818,15 @@ fn run() -> Result<()> {
 
   eprintln!("patching handleCertificatePinningChallenge");
 
-  match find_handle_pinning_challenge(&data, &macho) {
+  match find_handle_pinning_challenge(&data[macho_start..macho_end], &macho) {
     Some(addr) => {
       eprintln!("detected: 0x{addr:08X}");
 
-      if apply_patch(&mut data, addr, PATCH_PERFORM_DEFAULT) {
+      if apply_patch(
+        &mut data[macho_start..macho_end],
+        addr,
+        PATCH_PERFORM_DEFAULT,
+      ) {
         applied += 1;
       }
     }
